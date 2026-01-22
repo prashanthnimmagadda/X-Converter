@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: x-converter-backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - TEMP_DIR=/tmp/x-converter
+      - MAX_PROCESSING_TIME=30000
+    volumes:
+      - ./backend/temp:/app/temp
+    restart: unless-stopped
+    networks:
+      - x-converter-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  x-converter-network:
+    driver: bridge
