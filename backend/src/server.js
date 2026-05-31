@@ -2,11 +2,11 @@
  * X Content to PDF Converter - Backend Server
  */
 
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs').promises;
-const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const URLClassifier = require('./utils/urlClassifier');
@@ -14,188 +14,149 @@ const ContentRenderer = require('./renderer/contentRenderer');
 const PDFGenerator = require('./pdf/pdfGenerator');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const TEMP_DIR = process.env.TEMP_DIR || './temp';
+const PORT = Number(process.env.PORT || 3000);
+const TEMP_DIR = path.resolve(process.env.TEMP_DIR || './temp');
 
-// Middleware
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '32kb' }));
+app.use(express.urlencoded({ extended: true, limit: '32kb' }));
 
-// Initialize temp directory
 async function initTempDir() {
-  try {
-    await fs.mkdir(TEMP_DIR, { recursive: true });
-  } catch (error) {
-    console.error('Failed to create temp directory:', error);
-  }
+  await fs.mkdir(TEMP_DIR, { recursive: true });
 }
 
-// Health check endpoint
+function parseUrlFromBody(body) {
+  if (!body || typeof body.url !== 'string') {
+    return null;
+  }
+
+  const url = body.url.trim();
+  return url.length > 0 && url.length <= 2048 ? url : null;
+}
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    service: 'x-converter-backend',
+    timestamp: new Date().toISOString()
+  });
 });
 
-/**
- * Main conversion endpoint
- * POST /convert
- * Body: { url: string }
- */
 app.post('/convert', async (req, res) => {
   const startTime = Date.now();
   let tempFilePath = null;
 
   try {
-    const { url } = req.body;
+    const url = parseUrlFromBody(req.body);
 
-    // Validate URL
     if (!url) {
       return res.status(400).json({
         success: false,
-        error: 'URL is required'
+        error: 'A non-empty URL string is required'
       });
     }
 
     console.log(`[${new Date().toISOString()}] Converting URL: ${url}`);
 
-    // Step 1: Classify URL
     const normalizedUrl = URLClassifier.normalize(url);
     const classification = URLClassifier.classify(normalizedUrl);
 
     if (!classification.valid) {
       return res.status(400).json({
         success: false,
-        error: classification.error || 'Invalid URL'
+        error: classification.error || 'Invalid X/Twitter URL'
       });
     }
 
-    console.log(`  Classification: ${classification.type}`);
-
-    // Step 2: Render content
     const renderer = new ContentRenderer();
     let renderResult;
 
     try {
       renderResult = await renderer.render(normalizedUrl, classification);
-    } catch (error) {
-      console.error('  Rendering error:', error.message);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to render content',
-        details: error.message
-      });
     } finally {
       await renderer.close();
     }
 
-    if (!renderResult.success) {
-      return res.status(500).json({
+    if (!renderResult?.success || !renderResult.content) {
+      return res.status(502).json({
         success: false,
-        error: 'Failed to render content'
+        error: 'Failed to render content from X/Twitter'
       });
     }
 
-    console.log(`  Content rendered: ${renderResult.classification.type}`);
-
-    // Step 3: Generate PDF
     const pdfGenerator = new PDFGenerator();
-    tempFilePath = path.join(TEMP_DIR, `${uuidv4()}.pdf`);
-
+    tempFilePath = path.join(TEMP_DIR, `${crypto.randomUUID()}.pdf`);
     let pdfResult;
 
     try {
-      pdfResult = await pdfGenerator.generate(
-        renderResult.content,
-        normalizedUrl,
-        tempFilePath
-      );
-    } catch (error) {
-      console.error('  PDF generation error:', error.message);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to generate PDF',
-        details: error.message
-      });
+      pdfResult = await pdfGenerator.generate(renderResult.content, normalizedUrl, tempFilePath);
     } finally {
       await pdfGenerator.close();
     }
 
-    // Step 4: Send PDF
     const processingTime = Date.now() - startTime;
     console.log(`  PDF generated in ${processingTime}ms: ${pdfResult.filename}`);
 
-    // Set response headers
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${pdfResult.filename}"`);
-    res.setHeader('X-Processing-Time', processingTime);
+    res.setHeader('X-Processing-Time', String(processingTime));
     res.setHeader('X-Content-Type', renderResult.classification.type);
 
-    // Send file
-    res.sendFile(path.resolve(tempFilePath), async (err) => {
-      // Clean up temp file after sending
+    return res.sendFile(path.resolve(tempFilePath), async (err) => {
       try {
         await fs.unlink(tempFilePath);
       } catch (cleanupError) {
-        console.error('  Failed to clean up temp file:', cleanupError);
+        if (cleanupError.code !== 'ENOENT') {
+          console.error('Failed to clean up temp PDF:', cleanupError);
+        }
       }
 
-      if (err && !res.headersSent) {
-        console.error('  Failed to send PDF:', err);
-        res.status(500).json({
-          success: false,
-          error: 'Failed to send PDF'
-        });
+      if (err) {
+        console.error('Failed to send PDF:', err);
       }
     });
-
   } catch (error) {
-    console.error('Unexpected error:', error);
+    console.error('Conversion failed:', error);
 
-    // Clean up temp file on error
     if (tempFilePath) {
       try {
         await fs.unlink(tempFilePath);
-      } catch (cleanupError) {
-        // Ignore cleanup errors
+      } catch (_) {
+        // Ignore cleanup errors after a failed conversion.
       }
     }
 
     if (!res.headersSent) {
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
-        error: 'Internal server error',
+        error: 'Conversion failed',
         details: error.message
       });
     }
   }
 });
 
-/**
- * Validation endpoint (for quick URL check without conversion)
- * POST /validate
- * Body: { url: string }
- */
 app.post('/validate', (req, res) => {
   try {
-    const { url } = req.body;
+    const url = parseUrlFromBody(req.body);
 
     if (!url) {
       return res.status(400).json({
         success: false,
-        error: 'URL is required'
+        error: 'A non-empty URL string is required'
       });
     }
 
     const normalizedUrl = URLClassifier.normalize(url);
     const classification = URLClassifier.classify(normalizedUrl);
 
-    res.json({
+    return res.status(classification.valid ? 200 : 400).json({
       success: classification.valid,
       classification,
       normalizedUrl
     });
   } catch (error) {
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: 'Validation failed',
       details: error.message
@@ -203,49 +164,54 @@ app.post('/validate', (req, res) => {
   }
 });
 
-// Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error'
-  });
+  if (!res.headersSent) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
 
-// 404 handler
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Endpoint not found'
-  });
+  res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
-// Start server
 async function start() {
   await initTempDir();
 
-  app.listen(PORT, () => {
-    console.log(`X Content to PDF Converter Backend`);
+  const server = app.listen(PORT, () => {
+    console.log('X Content to PDF Converter Backend');
     console.log(`Server running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/health`);
-    console.log(`\nEndpoints:`);
-    console.log(`  POST /convert   - Convert X URL to PDF`);
-    console.log(`  POST /validate  - Validate X URL`);
+    console.log('\nEndpoints:');
+    console.log('  POST /convert   - Convert X/Twitter URL to PDF');
+    console.log('  POST /validate  - Validate X/Twitter URL');
   });
+
+  return server;
 }
 
-// Handle graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM, shutting down gracefully...');
-  process.exit(0);
-});
+if (require.main === module) {
+  let server;
 
-process.on('SIGINT', async () => {
-  console.log('Received SIGINT, shutting down gracefully...');
-  process.exit(0);
-});
+  start()
+    .then((startedServer) => {
+      server = startedServer;
+    })
+    .catch((error) => {
+      console.error('Failed to start server:', error);
+      process.exit(1);
+    });
 
-start().catch(error => {
-  console.error('Failed to start server:', error);
-  process.exit(1);
-});
+  const shutdown = (signal) => {
+    console.log(`Received ${signal}, shutting down gracefully...`);
+    if (!server) {
+      process.exit(0);
+    }
+    server.close(() => process.exit(0));
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+module.exports = { app, start, initTempDir, parseUrlFromBody };

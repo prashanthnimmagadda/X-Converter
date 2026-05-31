@@ -1,36 +1,45 @@
 /**
- * Content Renderer for X (Twitter) content
- * Uses Puppeteer to render dynamic content and prepare for PDF conversion
+ * Content Renderer for X/Twitter content.
+ * Uses Puppeteer to render dynamic public pages and extract PDF-ready content.
  */
 
-const puppeteer = require('puppeteer');
+const DEFAULT_TIMEOUT = Number(process.env.MAX_PROCESSING_TIME || 30000);
+
+async function loadPuppeteer() {
+  const module = await import('puppeteer');
+  return module.default || module;
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 class ContentRenderer {
   constructor() {
     this.browser = null;
   }
 
-  /**
-   * Initialize the browser
-   */
   async init() {
     if (!this.browser) {
-      this.browser = await puppeteer.launch({
+      const puppeteer = await loadPuppeteer();
+      const launchOptions = {
         headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        protocolTimeout: DEFAULT_TIMEOUT + 10000,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--disable-accelerated-2d-canvas',
-          '--disable-gpu'
+          '--disable-gpu',
+          '--disable-features=IsolateOrigins,site-per-process'
         ]
-      });
+      };
+
+      this.browser = await puppeteer.launch(launchOptions);
     }
   }
 
-  /**
-   * Close the browser
-   */
   async close() {
     if (this.browser) {
       await this.browser.close();
@@ -38,45 +47,26 @@ class ContentRenderer {
     }
   }
 
-  /**
-   * Render X content and return cleaned HTML
-   * @param {string} url - The X URL to render
-   * @param {Object} classification - URL classification result
-   * @returns {Object} - Rendered content data
-   */
   async render(url, classification) {
     await this.init();
-
     const page = await this.browser.newPage();
 
     try {
-      // Set viewport for mobile-optimized width
-      await page.setViewport({
-        width: 800,
-        height: 1200,
-        deviceScaleFactor: 2
-      });
-
-      // Set user agent
+      await page.setDefaultTimeout(DEFAULT_TIMEOUT);
+      await page.setDefaultNavigationTimeout(DEFAULT_TIMEOUT);
+      await page.setViewport({ width: 900, height: 1400, deviceScaleFactor: 2 });
       await page.setUserAgent(
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36'
       );
+      await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-GB,en;q=0.9' });
 
-      // Navigate to the URL
-      await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      });
-
-      // Wait for content to load
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: DEFAULT_TIMEOUT });
       await this.waitForContent(page, classification.type);
 
-      // Extract content based on type
       let content;
       if (classification.type === 'article') {
         content = await this.extractArticle(page);
       } else if (classification.type === 'post') {
-        // Check if it's a thread
         const isThread = await this.detectThread(page, classification.username);
         if (isThread) {
           content = await this.extractThread(page, classification.username);
@@ -87,7 +77,9 @@ class ContentRenderer {
         }
       }
 
-      await page.close();
+      if (!content) {
+        throw new Error('No extractable content found');
+      }
 
       return {
         success: true,
@@ -98,183 +90,133 @@ class ContentRenderer {
         }
       };
     } catch (error) {
-      await page.close();
-      throw new Error(`Rendering failed: ${error.message}`);
+      const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
+      const loginWall = /log in|sign in|create account|something went wrong/i.test(pageText);
+      const suffix = loginWall
+        ? ' Public X/Twitter pages may be behind a login or anti-bot wall; deploy with a reachable Chromium runtime and try a public URL.'
+        : '';
+      throw new Error(`Rendering failed: ${error.message}.${suffix}`);
+    } finally {
+      await page.close().catch(() => {});
     }
   }
 
-  /**
-   * Wait for content to load based on type
-   */
   async waitForContent(page, type) {
-    if (type === 'article') {
-      // Wait for article content
-      await page.waitForSelector('article', { timeout: 15000 }).catch(() => {});
-    } else {
-      // Wait for tweet content
-      await page.waitForSelector('[data-testid="tweet"]', { timeout: 15000 }).catch(() => {});
-    }
+    const selectors = type === 'article'
+      ? ['article', '[data-testid="article"]', '[data-testid="articleContent"]']
+      : ['[data-testid="tweet"]', 'article'];
 
-    // Additional wait for dynamic content
-    await page.waitForTimeout(2000);
+    await Promise.race([
+      Promise.any(selectors.map(selector => page.waitForSelector(selector, { timeout: 15000 }))).catch(() => null),
+      delay(15000)
+    ]);
+
+    await delay(1500);
   }
 
-  /**
-   * Extract article content
-   */
   async extractArticle(page) {
     return await page.evaluate(() => {
-      const article = document.querySelector('article');
+      const article = document.querySelector('[data-testid="articleContent"]')?.closest('article') || document.querySelector('article');
 
       if (!article) {
         throw new Error('Article content not found');
       }
 
-      // Extract title
-      const titleEl = article.querySelector('h1') || article.querySelector('[role="heading"]');
-      const title = titleEl ? titleEl.innerText : 'Untitled Article';
+      const clone = article.cloneNode(true);
+      clone.querySelectorAll('nav, [role="navigation"], [data-testid="advertisement"], aside, button, svg').forEach(el => el.remove());
 
-      // Extract author info
-      const authorLink = document.querySelector('a[href*="/"]:not([href*="/status/"])');
-      const author = authorLink ? authorLink.innerText : 'Unknown Author';
-
-      // Extract content
-      const contentEl = article.querySelector('[data-testid="articleContent"]') || article;
-
-      // Remove unwanted elements
-      const unwanted = contentEl.querySelectorAll(
-        'nav, [role="navigation"], [data-testid="advertisement"], aside, .login-prompt'
-      );
-      unwanted.forEach(el => el.remove());
-
-      // Get clean HTML
-      const html = contentEl.innerHTML;
-
-      // Extract images
-      const images = Array.from(contentEl.querySelectorAll('img')).map(img => ({
-        src: img.src,
-        alt: img.alt || ''
-      }));
+      const titleEl = clone.querySelector('h1') || clone.querySelector('[role="heading"]');
+      const title = titleEl ? titleEl.innerText.trim() : 'Untitled Article';
+      const authorEl = clone.querySelector('[data-testid="User-Name"]') || clone.querySelector('a[href^="/"]');
+      const author = authorEl ? authorEl.innerText.trim() : 'Unknown Author';
+      const contentEl = clone.querySelector('[data-testid="articleContent"]') || clone;
+      const images = Array.from(contentEl.querySelectorAll('img')).map(img => ({ src: img.src, alt: img.alt || '' }));
 
       return {
         type: 'article',
         title,
         author,
-        html,
+        html: contentEl.innerHTML,
         images,
         timestamp: new Date().toISOString()
       };
     });
   }
 
-  /**
-   * Detect if a post is part of a thread
-   */
   async detectThread(page, username) {
     return await page.evaluate((username) => {
-      // Look for "Show more replies" or multiple tweets by the same author
-      const tweets = document.querySelectorAll('[data-testid="tweet"]');
+      const tweets = Array.from(document.querySelectorAll('[data-testid="tweet"], article'));
+      if (tweets.length <= 1) return false;
 
-      if (tweets.length <= 1) {
-        return false;
-      }
-
-      // Check if there are multiple tweets by the same author in sequence
-      let consecutiveSameAuthor = 0;
+      let sameAuthorCount = 0;
+      const authorHref = `/${String(username).toLowerCase()}`;
       for (const tweet of tweets) {
-        const userLink = tweet.querySelector('a[href*="/' + username + '"]');
-        if (userLink) {
-          consecutiveSameAuthor++;
-          if (consecutiveSameAuthor >= 2) {
-            return true;
-          }
-        } else {
-          consecutiveSameAuthor = 0;
+        const links = Array.from(tweet.querySelectorAll('a[href]'));
+        const byAuthor = links.some(link => (link.getAttribute('href') || '').toLowerCase().startsWith(authorHref));
+        if (byAuthor) {
+          sameAuthorCount += 1;
+          if (sameAuthorCount >= 2) return true;
         }
       }
-
       return false;
     }, username);
   }
 
-  /**
-   * Extract single post
-   */
   async extractPost(page) {
     return await page.evaluate(() => {
-      const tweet = document.querySelector('[data-testid="tweet"]');
+      const tweet = document.querySelector('[data-testid="tweet"]') || document.querySelector('article');
 
       if (!tweet) {
         throw new Error('Tweet content not found');
       }
 
-      // Extract author info
       const authorEl = tweet.querySelector('[data-testid="User-Name"]');
-      const author = authorEl ? authorEl.innerText : 'Unknown';
-
-      // Extract timestamp
+      const author = authorEl ? authorEl.innerText.trim() : 'Unknown';
       const timeEl = tweet.querySelector('time');
       const timestamp = timeEl ? timeEl.getAttribute('datetime') : new Date().toISOString();
-
-      // Extract text content
       const textEl = tweet.querySelector('[data-testid="tweetText"]');
-      const text = textEl ? textEl.innerText : '';
+      const text = textEl ? textEl.innerText.trim() : tweet.innerText.trim();
+      const images = Array.from(tweet.querySelectorAll('img[src*="media"], img[src*="twimg"]'))
+        .filter(img => !/profile_images/.test(img.src))
+        .map(img => ({ src: img.src, alt: img.alt || '' }));
 
-      // Extract images
-      const images = Array.from(tweet.querySelectorAll('img[src*="media"]')).map(img => ({
-        src: img.src,
-        alt: img.alt || ''
-      }));
+      if (!text && images.length === 0) {
+        throw new Error('Tweet content was empty');
+      }
 
-      return {
-        type: 'post',
-        author,
-        timestamp,
-        text,
-        images
-      };
+      return { type: 'post', author, timestamp, text, images };
     });
   }
 
-  /**
-   * Extract thread (multiple posts by same author)
-   */
   async extractThread(page, username) {
     return await page.evaluate((username) => {
-      const tweets = Array.from(document.querySelectorAll('[data-testid="tweet"]'));
-
+      const tweets = Array.from(document.querySelectorAll('[data-testid="tweet"], article'));
       const threadPosts = [];
+      const authorHref = `/${String(username).toLowerCase()}`;
 
       for (const tweet of tweets) {
-        // Check if tweet is by the thread author
-        const userLink = tweet.querySelector('a[href*="/' + username + '"]');
+        const links = Array.from(tweet.querySelectorAll('a[href]'));
+        const byAuthor = links.some(link => (link.getAttribute('href') || '').toLowerCase().startsWith(authorHref));
 
-        if (userLink) {
-          // Extract author info
+        if (byAuthor) {
           const authorEl = tweet.querySelector('[data-testid="User-Name"]');
-          const author = authorEl ? authorEl.innerText : username;
-
-          // Extract timestamp
+          const author = authorEl ? authorEl.innerText.trim() : username;
           const timeEl = tweet.querySelector('time');
           const timestamp = timeEl ? timeEl.getAttribute('datetime') : new Date().toISOString();
-
-          // Extract text content
           const textEl = tweet.querySelector('[data-testid="tweetText"]');
-          const text = textEl ? textEl.innerText : '';
+          const text = textEl ? textEl.innerText.trim() : tweet.innerText.trim();
+          const images = Array.from(tweet.querySelectorAll('img[src*="media"], img[src*="twimg"]'))
+            .filter(img => !/profile_images/.test(img.src))
+            .map(img => ({ src: img.src, alt: img.alt || '' }));
 
-          // Extract images
-          const images = Array.from(tweet.querySelectorAll('img[src*="media"]')).map(img => ({
-            src: img.src,
-            alt: img.alt || ''
-          }));
-
-          threadPosts.push({
-            author,
-            timestamp,
-            text,
-            images
-          });
+          if (text || images.length) {
+            threadPosts.push({ author, timestamp, text, images });
+          }
         }
+      }
+
+      if (threadPosts.length === 0) {
+        throw new Error('Thread content not found');
       }
 
       return {

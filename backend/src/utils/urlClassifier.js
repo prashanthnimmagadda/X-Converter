@@ -1,101 +1,92 @@
 /**
- * URL Classifier for X (Twitter) content
- * Determines if a URL is an Article, Post, or Thread
+ * URL Classifier for X/Twitter content.
  */
 
 class URLClassifier {
-  /**
-   * Classify the X URL
-   * @param {string} url - The X URL to classify
-   * @returns {Object} - Classification result { type: 'article'|'post'|'thread', valid: boolean }
-   */
   static classify(url) {
     try {
       const urlObj = new URL(url);
 
-      // Validate domain
       if (!this.isXDomain(urlObj.hostname)) {
-        return { type: null, valid: false, error: 'Invalid X domain' };
+        return { type: null, valid: false, error: 'Invalid X/Twitter domain' };
       }
 
-      const pathname = urlObj.pathname;
+      const pathname = this.normalisePathname(urlObj.pathname);
 
-      // Check if it's an article (long-form content)
-      // X articles are typically at: x.com/i/articles/<id> or twitter.com/i/articles/<id>
-      if (pathname.includes('/i/articles/')) {
-        return { type: 'article', valid: true };
+      if (/^\/i\/articles\/[A-Za-z0-9_-]+\/?$/.test(pathname)) {
+        return { type: 'article', valid: true, articleId: pathname.split('/').pop() };
       }
 
-      // Check if it's a post/status
-      // Format: x.com/<username>/status/<id>
-      const statusMatch = pathname.match(/^\/([^\/]+)\/status\/(\d+)/);
+      const statusMatch = pathname.match(/^\/([^/]+)\/status(?:es)?\/(\d+)\/?$/);
       if (statusMatch) {
-        const username = statusMatch[1];
+        const username = decodeURIComponent(statusMatch[1]);
         const tweetId = statusMatch[2];
+
+        if (!this.isValidUsername(username)) {
+          return { type: null, valid: false, error: 'Invalid X/Twitter username' };
+        }
 
         return {
           type: 'post',
           valid: true,
           username,
           tweetId,
-          // We'll determine if it's a thread during rendering
           needsThreadCheck: true
         };
       }
 
-      return { type: null, valid: false, error: 'Unknown URL format' };
-    } catch (error) {
+      return { type: null, valid: false, error: 'Unsupported X/Twitter URL format' };
+    } catch (_) {
       return { type: null, valid: false, error: 'Invalid URL format' };
     }
   }
 
-  /**
-   * Check if hostname is a valid X domain
-   * @param {string} hostname - The hostname to check
-   * @returns {boolean}
-   */
   static isXDomain(hostname) {
-    const validDomains = [
+    const normalised = hostname.toLowerCase();
+    return [
       'x.com',
       'www.x.com',
+      'mobile.x.com',
       'twitter.com',
       'www.twitter.com',
-      'mobile.twitter.com',
-      'mobile.x.com'
-    ];
-
-    return validDomains.includes(hostname.toLowerCase());
+      'mobile.twitter.com'
+    ].includes(normalised);
   }
 
-  /**
-   * Normalize URL to standard format
-   * @param {string} url - The URL to normalize
-   * @returns {string} - Normalized URL
-   */
+  static isValidUsername(username) {
+    return /^[A-Za-z0-9_]{1,15}$/.test(username);
+  }
+
+  static normalisePathname(pathname) {
+    return pathname.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+  }
+
   static normalize(url) {
     try {
-      const urlObj = new URL(url);
+      const trimmed = String(url || '').trim();
+      const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+      const urlObj = new URL(withProtocol);
 
-      // Convert twitter.com to x.com for consistency
-      if (urlObj.hostname.includes('twitter.com')) {
-        urlObj.hostname = urlObj.hostname.replace('twitter.com', 'x.com');
-      }
+      urlObj.protocol = 'https:';
+      urlObj.hostname = urlObj.hostname
+        .toLowerCase()
+        .replace(/^mobile\./, '')
+        .replace(/^www\./, '')
+        .replace('twitter.com', 'x.com');
 
-      // Remove query parameters that don't affect content
-      const paramsToKeep = ['s']; // Keep share tracking if needed
-      const newSearchParams = new URLSearchParams();
+      urlObj.pathname = this.normalisePathname(urlObj.pathname);
 
-      for (const param of paramsToKeep) {
-        if (urlObj.searchParams.has(param)) {
-          newSearchParams.set(param, urlObj.searchParams.get(param));
+      const keepParams = new Set(['s']);
+      for (const key of Array.from(urlObj.searchParams.keys())) {
+        if (!keepParams.has(key)) {
+          urlObj.searchParams.delete(key);
         }
       }
 
-      urlObj.search = newSearchParams.toString();
-
+      urlObj.hash = '';
       return urlObj.toString();
-    } catch (error) {
-      return url;
+    } catch (_) {
+      return String(url || '').trim();
     }
   }
 }
